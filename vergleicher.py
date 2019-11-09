@@ -1,4 +1,4 @@
-import torch
+#import torch
 import cv2
 import numpy as np
 import itertools
@@ -11,7 +11,20 @@ from scipy.signal import convolve
 from skimage.measure import block_reduce
 import cProfile
 from dask.array.ufunc import logaddexp
-
+#######################################################
+#######################################################
+# Conventions:
+# finder output is (not ready,right top, right bottom)
+#######################################################
+# performaces failures:
+# extra loop for nolinear layers *1.5
+# extra delta index small
+# phasespacepropagation loop only over no zero elements 4N^2 instead of N^6
+#######################################################
+# Designdesitions:
+# pool takes max and not extrem
+#######################################################
+#######################################################
 
 
 def splittimg(f):
@@ -57,23 +70,24 @@ filter4 = (np.random.rand(4, 4, 4, 2) - 0.5) / 2
 filter5 = (np.random.rand(1, 1, 1, 4) - 0.5) / 2
 fullyconneted = (np.random.rand(3, 36) - 0.5) / 2
 
-I = np.random.rand(30, 30, 3)
+I = np.random.rand(3, 30, 30)
 
 
-def modelbuilder(tuple_list, input_dimensions):
+def modelbuilder(tuple_list, input_dimension_numbers):
     # list of tuples which contains the names and the dimensions if necessary
     #[('name',dimensions)]
-    class model_class():
+    class model_class:
         def __init__(self, weight_list):
+            input_dimensions = input_dimension_numbers
             assert len(weight_list) == len(tuple_list)
             self.weight_list = []
             self.call_list = []
-            self.input_dimensions = input_dimensions
-            self.back_list=[]
-            self.derivative_list=[]
+            #self.input_dimensions = input_dimensions
+            self.back_list = []
+            self.derivative_list = []
             for n, (kind, dimensions) in enumerate(tuple_list):
                 if kind == 'fully_connected':
-                    if weight_list[n] == None:
+                    if type(weight_list[n]) == type(None):
                         weight_list[n] = (np.random.rand(dimensions) - 0.5) / 2
                     else:
                         assert np.shape(weight_list[n]) == dimensions
@@ -84,14 +98,14 @@ def modelbuilder(tuple_list, input_dimensions):
                     self.call_list.append(
                         generator_apply_fully_connected(self, n))
                 if kind == 'filter':
-                    if weight_list[n] == None:
+                    if type(weight_list[n]) == type(None):
                         weight_list[n] = (np.random.rand(dimensions) - 0.5) / 2
                     else:
                         assert np.shape(weight_list[n]) == dimensions
                     assert len(input_dimensions) == 3
                     assert np.shape(weight_list[n])[3] == input_dimensions[0]
-                    assert np.shape(weight_list[n])[1] >= input_dimensions[1]
-                    assert np.shape(weight_list[n])[2] >= input_dimensions[2]
+                    assert np.shape(weight_list[n])[1] <= input_dimensions[1]
+                    assert np.shape(weight_list[n])[2] <= input_dimensions[2]
                     input_dimensions = (np.shape(weight_list[n])[0], input_dimensions[1] - np.shape(
                         weight_list[n])[1] + 1, input_dimensions[2] - np.shape(weight_list[n])[2] + 1)
                     self.weight_list.append(weight_list[n])
@@ -110,91 +124,133 @@ def modelbuilder(tuple_list, input_dimensions):
                     assert input_dimensions[1] % dimensions[1] == 0
                     assert input_dimensions[2] % dimensions[2] == 0
                     assert weight_list[n] == None
-                    input_dimensions //= dimensions
+                    input_dimensions = tuple(
+                        np.array(input_dimensions) // np.array(dimensions))
                     self.weight_list.append(weight_list[n])
                     self.call_list.append(generator_apply_pooling(dimensions))
-                if kind=='view':
+                if kind == 'view':
                     assert weight_list[n] == None
-                    assert np.product(input_dimensions)==np.product(dimensions)
+                    assert np.product(
+                        input_dimensions) == np.product(dimensions)
+                    input_dimensions = dimensions
+                    self.weight_list.append(weight_list[n])
                     self.call_list.append(generator_apply_view(dimensions))
             for n, (kind, dimensions) in enumerate(tuple_list[::-1]):
                 if kind == 'fully_connected':
-                    self.back_list.append(generator_back_fully_connected(self,n))
-                if kind=='filter':
-                    self.back_list.append(generator_back_filter(self,n))
-                if kind=='sigmoid':
-                    self.back_list.append(generator_back_filter())
-                if kind=='softmax':
+                    self.back_list.append(
+                        generator_back_fully_connected(self, n))
+                if kind == 'filter':
+                    self.back_list.append(generator_back_filter(self, n))
+                if kind == 'sigmoid':
+                    self.back_list.append(generator_back_sigmoid())
+                if kind == 'softmax':
                     self.back_list.append(generator_back_softmax())
-                if kind=='pooling':
+                if kind == 'pooling':
                     self.back_list.append(generator_back_pooling(dimensions))
-                    
-                    
-                    
-                
-        
-        def __call__(self,inp):
+                if kind == 'view':
+                    self.back_list.append(generator_back_view(dimensions))
+            for n, (kind, dimensions) in enumerate(tuple_list[::-1]):
+                if kind == 'fully_connected':
+                    self.derivative_list.append(
+                        generator_derivative_fully_connected(self, n))
+                elif kind == 'filter':
+                    self.derivative_list.append(
+                        generator_derivative_filter(self, n))
+                else:
+                    self.derivative_list.append(None)
+
+        def __call__(self, inp):
             for func in self.call_list:
-                inp=func(inp)
+                inp = func(inp)
             return inp
-        
-        def __back__(self,inp):
-            propagation_values=[inp]
+
+        def calculate_derivatives(self, inp):
+            propagation_values = [inp]
             for func in self.call_list:
                 propagation_values.append(func(propagation_values[-1]))
-            back_progation_values=[propagation_values[-1]]
-            for n,func in enumerate(self.back_list):
-                back_progation_values.append(func(back_progation_values[-1],propagation_values[-n-1]))
-            return back_progation_values
+            derivatives = []
+            first_old_back = np.zeros(
+                np.shape(propagation_values[-1]) + np.shape(propagation_values[-1]))
+            for i, _ in np.ndenumerate(propagation_values[-1]):
+                first_old_back[i + i] = 1
+            back_progation_values = [first_old_back]
+            # print(back_progation_values[-1])
+            # print(self.derivative_list)
+            for n, func in enumerate(self.back_list):
+                if self.derivative_list[n] != None:
+                    print('derivative', n, func.__name__)
+                    derivatives.append(
+                        self.derivative_list[n](back_progation_values[-1], propagation_values[-n - 2]))
+                back_progation_values.append(
+                    func(back_progation_values[-1], propagation_values[-n - 2]))
+            return back_progation_values, derivatives
 
-    def generator_apply_fully_connected(model,n):
+    def generator_apply_fully_connected(model, n):
         def apply_fully_connected(inp):
-            return model.weightlist[n]@inp
+            return model.weight_list[n]@inp
         return apply_fully_connected
-    
-    def generator_back_fully_connected(model,n):
-        def back_fully_connected(oldback,propagation_values):
+
+    def generator_back_fully_connected(model, n):
+        def back_fully_connected(oldback, _):
             newback = np.zeros(
-                tuple([np.shape(model.weights[-n-1])[1]] + list(np.shape(oldback)[1:])))
+                tuple([np.shape(model.weight_list[-n - 1])[1]] + list(np.shape(oldback)[1:])))
             for i, _ in np.ndenumerate(newback):
-                newback[i] = sum([oldback[(a,) + i[1:]] * model.weights[-n-1][a, i[0]]
-                                  for a in range(np.shape(model.weights[-n-1])[0])])
+                #print(model.weight_list[-n - 1])
+                # print(np.shape(oldback))
+                newback[i] = sum([oldback[(a,) + i[1:]] * model.weight_list[-n - 1][a, i[0]]
+                                  for a in range(np.shape(model.weight_list[-n - 1])[0])])
+            # print(np.shape(newback))
             return newback
         return back_fully_connected
-    ##################################
-    def generator_derivative_fully_connected(self):
-        def derivative_fully_connected(oldback, weights, inp):
-            derivative = np.zeros(np.shape(weights) + np.shape(oldback)[1:])
+
+    def generator_derivative_fully_connected(model, n):
+        def derivative_fully_connected(oldback, propagation_values):
+            derivative = np.zeros(
+                np.shape(model.weight_list[-n - 1]) + np.shape(oldback)[1:])
             for i, _ in np.ndenumerate(derivative):
-                derivative[i] = oldback[(i[0],) + i[2:]] * inp[i[1]]
+                derivative[i] = oldback[(i[0],) + i[2:]] * \
+                    propagation_values[i[1]]
+            print('here', np.shape(derivative))
             return derivative
         return derivative_fully_connected
-    ##########################################
 
     def generator_apply_filter(model, n):
         def apply_filter(inp):
             return conv(model.weight_list[n], inp)
         return apply_filter
-    
-    def generator_back_filter(model,n):
-        def back_filter(oldback,propagation_value):
-            newback = np.zeros((np.shape(model.weights[-n-1])[3],np.shape[model.weights[-n-1]][1]+oldback[1]-1,np.shape[model.weights[-n-1]][2]+oldback[2]-1) + np.shape(oldback)[2:])
+
+    def generator_back_filter(model, n):
+        def back_filter(oldback, _):
+            newback = np.zeros((np.shape(model.weight_list[-n - 1])[3], np.shape(model.weight_list[-n - 1])[1] +
+                                np.shape(oldback)[1] - 1, np.shape(model.weight_list[-n - 1])[2] + np.shape(oldback)[2] - 1) + np.shape(oldback)[3:])
+            # rint(np.shape(oldback))
             for i, _ in np.ndenumerate(newback):
-                newback[i] = sum([oldback[(g0,g1,g2) + i[2:]] * model.weights[-n-1][g0, i[1]-g1,i[2]-g2,i[0]]
-                                  for g0 in range(np.shape(model.weights[-n-1])[0]) for g1 in range(max(0, i[1] - np.shape(model.weights[-n-1])[1] + 1), min(np.shape(oldback)[1], i[1] + 1)) for g2 in range(max(0, i[2] - np.shape(model.weights[-n-1])[2] + 1), min(np.shape(model.weights[-n-1])[2], i[2] + 1))])
+                newback[i] = sum([oldback[(g0, g1, g2) + i[3:]] * model.weight_list[-n - 1][g0, i[1] - g1, i[2] - g2, i[0]]
+                                  for g0 in range(np.shape(model.weight_list[-n - 1])[0]) for g1 in range(max(0, i[1] - np.shape(model.weight_list[-n - 1])[1] + 1), min(np.shape(oldback)[1], i[1] + 1)) for g2 in range(max(0, i[2] - np.shape(model.weight_list[-n - 1])[2] + 1), min(np.shape(oldback)[2], i[2] + 1))])
             return newback
         return back_filter
+
+    def generator_derivative_filter(model, n):
+        def derivative_filter(oldback, propagation_value):
+            derivative = np.zeros(
+                np.shape(model.weight_list[-n - 1]) + np.shape(oldback)[3:])
+            for i, _ in np.ndenumerate(derivative):
+                derivative[i] = sum([oldback[(i[0], m1, m2) + i[4:]] * propagation_value[i[3], i[1] + m1, i[2] + m2]
+                                     for m1 in range(np.shape(oldback)[1]) for m2 in range(np.shape(oldback)[2])])
+            return derivative
+        return derivative_filter
 
     def generator_apply_sigmoid():
         def apply_sigmoid(inp):
             return expit(inp)
         return apply_sigmoid
-    
+
     def generator_back_sigmoid():
-        def back_sigmoid(oldback,propagation_value):
-            newback=np.zeros(np.shape(oldback))
-            for i,_ in np.ndenumerate(newback):
-                newback[i]=oldback[i]*expit(propagation_value[i[:len(np.shape(propagation_value))]])*(1-expit(propagation_value[i[:len(np.shape(propagation_value))]]))                
+        def back_sigmoid(oldback, propagation_value):
+            newback = np.zeros(np.shape(oldback))
+            for i, _ in np.ndenumerate(newback):
+                newback[i] = oldback[i] * expit(propagation_value[i[:len(np.shape(propagation_value))]]) * (
+                    1 - expit(propagation_value[i[:len(np.shape(propagation_value))]]))
             return newback
         return back_sigmoid
 
@@ -202,41 +258,96 @@ def modelbuilder(tuple_list, input_dimensions):
         def apply_softmax(inp):
             return np.logaddexp(inp, 0)
         return apply_softmax
-    
+
     def generator_back_softmax():
-        def back_softmax(oldback,propagation_value):
-            newback=np.zeros(np.shape(oldback))
-            for i,_ in np.ndenumerate(newback):
-                newback[i]=oldback[i]*expit(propagation_value[i[:len(np.shape(propagation_value))]])              
+        def back_softmax(oldback, propagation_value):
+            newback = np.zeros(np.shape(oldback))
+            #print(np.shape(propagation_value), np.shape(oldback))
+            # print(len(np.shape(propagation_value)))
+            for i, _ in np.ndenumerate(newback):
+                #print(i, i[:len(np.shape(propagation_value))])
+                newback[i] = oldback[i] * \
+                    expit(
+                        propagation_value[i[:len(np.shape(propagation_value))]])
             return newback
         return back_softmax
-    
+
     def generator_apply_pooling(dimensions):
         def apply_pooling(inp):
             return block_reduce(inp, (dimensions), np.max)
         return apply_pooling
-    
+
     def generator_back_pooling(dimensions):
-        def back_pooling(oldback,propagation_value):
-            newback=np.zeros(np.shape(propagation_value)+np.shape(oldback)[3:])
-            for i,_ in np.ndenumerate(newback):
-                sli = propagation_value[i[0]//dimensions[0]*dimensions[0]:i[0]//dimensions[0]*dimensions[0]+dimensions[0], i[1]//dimensions[1]*dimensions[1]:i[1]//dimensions[1]*dimensions[1]+dimensions[1],
-                     i[2]//dimensions[2]*dimensions[2]:i[2]//dimensions[2]*dimensions[2]+dimensions[2]]
-                newback(i)=sum([oldback[(g0,g1,g2)+i[3:]]*((g0%dimensions[0],g1%dimensions[1],g2%dimensions[2])==np.where(sli == np.max(sli))) for g0 in range(np.shape(oldback)[0]) for g1 in range(np.shape(oldback)[0]) for g2 in range(np.shape(oldback)[0])])
+        def back_pooling(oldback, propagation_value):
+            newback = np.zeros(
+                np.shape(propagation_value) + np.shape(oldback)[3:])
+            for i, _ in np.ndenumerate(newback):
+                sli = propagation_value[i[0] // dimensions[0] * dimensions[0]:i[0] // dimensions[0] * dimensions[0] + dimensions[0], i[1] // dimensions[1] * dimensions[1]:i[1] // dimensions[1] * dimensions[1] + dimensions[1],
+                                        i[2] // dimensions[2] * dimensions[2]:i[2] // dimensions[2] * dimensions[2] + dimensions[2]]
+                newback[i] = oldback[(i[0] // dimensions[0], i[1] // dimensions[1], i[2] // dimensions[2]) + i[3:]] * (
+                    (i[0] % dimensions[0], i[1] % dimensions[1], i[2] % dimensions[2]) == np.where(sli == np.max(sli)))
             return newback
         return back_pooling
-    
+
     def generator_apply_view(dimension):
         def apply_view(inp):
             return np.reshape(inp, dimension)
         return apply_view
-    
-    #not ready yet
+
     def generator_back_view(dimensions):
-        def back_view(oldback,propagation_value):
-            newback=np.zeros(np.shape(propagation_value)+np.shape(oldback)[len(dimensions):])
-            for i,_ in np.ndenumerate(newback):
-                newback[i]=oldback[(,)+i[len(dimensions):]]
+        def back_view(oldback, propagation_value):
+            newback = np.reshape(oldback, np.shape(
+                propagation_value) + np.shape(oldback)[len(dimensions):])
+            #print('asdfasd', np.shape(oldback), np.shape(propagation_value), np.shape(newback))
+            #print(np.shape(newback), np.shape(oldback), np.shape(propagation_value))
+            return newback
+        return back_view
+
+    return model_class
+
+
+def diagonal_to_straight(finder):
+    # np.shape(finder)=(N,N,3)
+    straight = np.zeros(np.shape(finder)[:2] + (4,))
+    for i, _ in np.ndenumerate(straight[:, :, 0]):
+        straight[i, 0] = finder[i + (0,)] * \
+            (1 - finder[i + (1,)]) * finder[i + (2,)]
+        straight[i, 1] = finder[i + (0,)] * \
+            finder[i + (1,)] * (1 - finder[i + (2,)])
+        straight[i, 2] = finder[i + (0,)] * finder[i + (1,)] * finder[i + (2,)]
+        straight[i, 3] = finder[i + (0,)] * (1 -
+                                             finder[i + (1,)]) * (1 - finder[i + (2,)])
+    return straight
+
+
+def phasespace_view(straight):
+    N = np.shape(straight)[0]
+    view = np.zeros((N, N, N, N, N, N, 4))
+    for i in range(N):
+        for j in range(N):
+            if i < N - 1:
+                view[i + 1, j, i, j, i, j, 0] = 1
+                view[i, j, i + 1, j, i + 1, j, 1] = 1
+            if j < N - 1:
+                view[i, j + 1, i, j, i, j, 2] = 1
+                view[i, j, i, j + 1, i, j + 1, 3] = 1
+    phasespace_progator = np.zeros((N, N, N, N))
+    for i, _ in np.ndenumerate(phasespace_progator):
+        phasespace_progator[i] = sum(
+            [view[i + j] * straight[j] for j, _ in np.ndenumerate(straight)])
+    print(phasespace_progator.reshape((N * N, N * N)))
+    
+def phasespace_flow(phasespace_propagator):
+    n=np.shape(phasespace_propagator)[0]**0.5//2
+    return np.linalg.inv(phasespace_propagator-np.eye(np.shape(phasespace_propagator)[0]))@(np.linalg.matrix_power(phasespace_propagator, n)-np.eye(np.shape(phasespace_propagator)[0]))@
+
+
+small_straight = np.arange(9).reshape((3, 3))
+straight = np.zeros((3, 3, 4))
+straight[:, :, 0] = small_straight
+straight[:, :, 2] = small_straight
+print(straight)
+phasespace_view(straight)
 
 
 class CompareDescribeClass():
@@ -280,7 +391,7 @@ class CompareDescribeClass():
             self.f5p_row + 1, self.f4_column - self.f5p_column + 1
 
     def __call__(self, I):
-        I = np.swapaxes(np.swapaxes(I, 0, 2), 1, 2)
+        #I = np.swapaxes(np.swapaxes(I, 0, 2), 1, 2)
         # make the color first index
         f1 = conv(self.f1p, I)
         sf1 = np.logaddexp(f1, 0)
@@ -300,7 +411,7 @@ class CompareDescribeClass():
         return sf5
 
     def derivatives(self, I):
-        I = np.swapaxes(np.swapaxes(I, 0, 2), 1, 2)
+        #I = np.swapaxes(np.swapaxes(I, 0, 2), 1, 2)
         # make the color first index
         f1 = conv(self.f1p, I)
         sf1 = np.logaddexp(f1, 0)
@@ -317,7 +428,7 @@ class CompareDescribeClass():
         f5 = conv(self.f5p, sf4)
         # print(F)
         sf5 = np.logaddexp(f5, 0)
-        
+
         back1 = expit(f5)
         df5 = np.zeros((self.f5p_depth, self.f5p_row, self.f5p_column,
                         self.f5p_color, self.f5_depth, self.f5_row, self.f5_column))
@@ -338,7 +449,7 @@ class CompareDescribeClass():
         for (b1, b2, b3, b4, a1, a2, a3), _ in np.ndenumerate(df4):
             df4[b1, b2, b3, b4, a1, a2, a3] = sum(
                 [back2[b1, g2, g3, a1, a2, a3] * sf3[b4, g2 + b2, g3 + b3] for g2 in range(back2shape[1]) for g3 in range(back2shape[2])])
-        
+
         back3 = np.zeros((self.f3_depth, self.f3_row,
                           self.f3_column, self.f5_depth, self.f5_row, self.f5_column))
         back3shape = np.shape(back3)
@@ -351,7 +462,7 @@ class CompareDescribeClass():
         for (b1, b2, b3, b4, a1, a2, a3), _ in np.ndenumerate(df3):
             df3[b1, b2, b3, b4, a1, a2, a3] = sum(
                 [back3[b1, m2, m3, a1, a2, a3] * p[b4, m2 + b2, m3 + b3] for m2 in range(self.f3_row) for m3 in range(self.f3_column)])
-        
+
         back4 = np.zeros((self.f2_depth, self.f2_row,
                           self.f2_column, self.f5_depth, self.f5_row, self.f5_column))
         for (x1, x2, x3, a1, a2, a3), _ in np.ndenumerate(back4):
@@ -418,7 +529,7 @@ class FinderClass():
         self.F_type = self.Fp_type
 
     def __call__(self, I):
-        I = np.swapaxes(np.swapaxes(I, 0, 2), 1, 2)
+        #I = np.swapaxes(np.swapaxes(I, 0, 2), 1, 2)
         # make the color first index
         f1 = conv(self.f1p, I)
         sf1 = np.logaddexp(f1, 0)
@@ -438,7 +549,7 @@ class FinderClass():
         return s
 
     def derivatives(self, I):
-        I = np.swapaxes(np.swapaxes(I, 0, 2), 1, 2)
+        #I = np.swapaxes(np.swapaxes(I, 0, 2), 1, 2)
         # make the color first index
         f1 = conv(self.f1p, I)
         sf1 = np.logaddexp(f1, 0)
@@ -557,8 +668,8 @@ class FindFilterClass:
         return t
 
 
-#finder1 = FinderClass(filter1, filter2, filter3, filter4, fullyconneted)
-compare1 = CompareDescribeClass(filter1, filter2, filter3, filter4, filter5)
+finder1 = FinderClass(filter1, filter2, filter3, filter4, fullyconneted)
+#compare1 = CompareDescribeClass(filter1, filter2, filter3, filter4, filter5)
 #finder2 = FindFilterClass(filter1, filter2, filter3, filter4, fullyconneted)
 # print(finder1(I))
 # print(finder2(I))
@@ -592,8 +703,20 @@ def numericdiff(f, inpt, index):
     return der
 
 
-d2 = numericdiff(comparefunction, [
-    I, filter1, filter2, filter3, filter4, filter5], 1)
-d1 = compare1.derivatives(I)
-print(np.max(d2 - d1), np.max(d2))
+"""
+modelclass = modelbuilder([('filter', (3, 6, 6, 3)), ('softmax', None), ('filter', (3, 6, 6, 3)), ('pooling', (1, 2, 2)), ('filter', (2, 5, 5, 3)), (
+    'softmax', None), ('filter', (4, 4, 4, 2)), ('softmax', None), ('view', (36,)), ('fully_connected', (3, 36)), ('sigmoid', None)], (3, 30, 30))
+model = modelclass([filter1, None, filter2, None, filter3,
+                    None, filter4, None, None, fullyconneted, None])
+
+print(model(I), finder1(I))
+backs, diffs = model.calculate_derivatives(I)
+print(np.max(diffs[4] - finder1.derivatives(I)),
+      np.max(finder1.derivatives(I)))
+
+# d2 = numericdiff(comparefunction, [
+#    I, filter1, filter2, filter3, filter4, filter5], 1)
+#d1 = compare1.derivatives(I)
+#print(np.max(d2 - d1), np.max(d2))
 # cProfile.run('finder1.derivatives(I)')
+"""
